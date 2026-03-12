@@ -1,0 +1,229 @@
+name: Liquibase Promote
+
+# Dynamic run-name includes environment for unique identification
+run-name: Promote to ${{ inputs.environment }} - Run #${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_artifact_name:
+        description: 'Source artifact name (e.g., deployment-dev-42)'
+        required: true
+        type: string
+      source_run_id:
+        description: 'Workflow run ID that created the artifact'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+      dispatch_id:
+        description: 'Unique dispatch ID for tracking (auto-generated)'
+        required: false
+        type: string
+      secrets_env:
+        description: 'App environment name for secrets lookup (defaults to environment)'
+        required: false
+        type: string
+
+# Concurrency group per environment - prevents parallel db operations (FR-022f)
+concurrency:
+  group: db-operations-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote to ${{ inputs.environment }}
+    runs-on: ${{ vars.LIQUIBASE_RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Download deployment artifact from source
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.source_artifact_name }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: liquibase/
+
+      - name: Verify artifact contents
+        run: |
+          echo "📦 Verifying artifact contents..."
+          if [ ! -f "liquibase/changelog.xml" ]; then
+            echo "::error::Missing changelog.xml in artifact"
+            exit 1
+          fi
+          if [ ! -d "liquibase/changelogs" ]; then
+            echo "::error::Missing changelogs directory in artifact"
+            exit 1
+          fi
+          echo "✅ Artifact structure verified"
+          echo "Files found:"
+          find liquibase -type f | head -20
+
+      - name: Check for pre-installed Liquibase
+        id: check-liquibase
+        run: |
+          if command -v liquibase &> /dev/null; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "✅ Liquibase is pre-installed: $(liquibase --version | head -1)"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Liquibase not found, will install via setup-liquibase"
+          fi
+
+      - name: Setup Liquibase
+        if: steps.check-liquibase.outputs.found != 'true'
+        uses: liquibase/setup-liquibase@v2
+        with:
+          version: '5.0.0'
+          edition: 'secure'
+
+      - name: Retrieve Liquibase License Key
+        run: |
+          set -euo pipefail
+
+          DEPLOYER_URL="${{ vars.LIQUIBASE_DEPLOYER_URL }}"
+          if [ -z "$DEPLOYER_URL" ]; then
+            echo "::error::LIQUIBASE_DEPLOYER_URL variable not set"
+            exit 1
+          fi
+
+          # Request OIDC token from GitHub
+          OIDC_TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$DEPLOYER_URL" | jq -r '.value // empty' 2>/dev/null || true)
+
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "::error::Failed to retrieve OIDC token"
+            exit 1
+          fi
+
+          # Exchange OIDC token for license key
+          RESPONSE_BODY_FILE=$(mktemp)
+          RESPONSE_HEADERS_FILE=$(mktemp)
+          trap 'rm -f "$RESPONSE_BODY_FILE" "$RESPONSE_HEADERS_FILE"' EXIT
+
+          HTTP_STATUS=$(curl -sS -o "$RESPONSE_BODY_FILE" -D "$RESPONSE_HEADERS_FILE" -w "%{http_code}" -X POST "${DEPLOYER_URL}/api/license/token" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg token "$OIDC_TOKEN" '{token: $token}')" || true)
+
+          if ! echo "$HTTP_STATUS" | grep -Eq '^[0-9]{3}$'; then
+            HTTP_STATUS="000"
+          fi
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            ERROR_CODE=$(jq -r '.code // empty' "$RESPONSE_BODY_FILE" 2>/dev/null || true)
+            ERROR_MESSAGE=$(jq -r '.message // empty' "$RESPONSE_BODY_FILE" 2>/dev/null || true)
+            RETRY_AFTER=$(jq -r '.details.retryAfter // empty' "$RESPONSE_BODY_FILE" 2>/dev/null || true)
+            REQUEST_ID=$(awk 'tolower($1) == "x-request-id:" { print $2 }' "$RESPONSE_HEADERS_FILE" | tr -d '\r' | tail -n 1)
+
+            if [ "$HTTP_STATUS" = "000" ]; then
+              echo "::error::Could not reach Liquibase Deploy to retrieve a license key. Check network connectivity and LIQUIBASE_DEPLOYER_URL."
+            else
+              case "$ERROR_CODE" in
+                NOT_FOUND)
+                  echo "::error::No Liquibase license key is configured for this organization. Ask your Liquibase administrator to configure one in the Liquibase Deploy admin panel."
+                  ;;
+                FORBIDDEN)
+                  echo "::error::This repository is not authorized in Liquibase Deploy. Reconnect the repository and confirm the Liquibase GitHub App installation."
+                  ;;
+                UNAUTHORIZED)
+                  echo "::error::GitHub OIDC authentication failed while requesting a Liquibase license key. Re-run the workflow and verify LIQUIBASE_DEPLOYER_URL."
+                  ;;
+                RATE_LIMITED)
+                  if [ -n "$RETRY_AFTER" ] && [ "$RETRY_AFTER" != "null" ]; then
+                    echo "::error::Liquibase license service rate limit exceeded. Retry in $RETRY_AFTER seconds."
+                  else
+                    echo "::error::Liquibase license service rate limit exceeded. Retry in a minute."
+                  fi
+                  ;;
+                *)
+                  if [ -n "$ERROR_MESSAGE" ] && [ "$ERROR_MESSAGE" != "null" ]; then
+                    echo "::error::Failed to retrieve Liquibase license key (HTTP $HTTP_STATUS): $ERROR_MESSAGE"
+                  else
+                    echo "::error::Failed to retrieve Liquibase license key (HTTP $HTTP_STATUS)."
+                  fi
+                  ;;
+              esac
+            fi
+
+            if [ -n "$REQUEST_ID" ]; then
+              echo "::notice::Liquibase request ID: $REQUEST_ID"
+            fi
+            exit 1
+          fi
+
+          LICENSE_KEY=$(jq -r '.licenseKey // empty' "$RESPONSE_BODY_FILE" 2>/dev/null || true)
+          if [ -z "$LICENSE_KEY" ] || [ "$LICENSE_KEY" = "null" ]; then
+            echo "::error::Liquibase license service returned an invalid response."
+            exit 1
+          fi
+
+          # Mask and export
+          echo "::add-mask::$LICENSE_KEY"
+          echo "LIQUIBASE_LICENSE_KEY=$LICENSE_KEY" >> $GITHUB_ENV
+
+      - name: Set environment variables
+        id: env
+        run: |
+          ENV_NAME="${{ inputs.secrets_env || inputs.environment }}"
+          ENV_UPPER=$(echo "$ENV_NAME" | tr '[:lower:]' '[:upper:]')
+          echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
+          echo "env_upper=$ENV_UPPER" >> $GITHUB_OUTPUT
+
+      - name: Run Liquibase Update (from artifact)
+        working-directory: liquibase
+        env:
+          LIQUIBASE_URL: ${{ secrets[format('LIQUIBASE_{0}_URL', steps.env.outputs.env_upper)] }}
+          LIQUIBASE_USERNAME: ${{ secrets[format('LIQUIBASE_{0}_USERNAME', steps.env.outputs.env_upper)] }}
+          LIQUIBASE_PASSWORD: ${{ secrets[format('LIQUIBASE_{0}_PASSWORD', steps.env.outputs.env_upper)] }}
+          LIQUIBASE_SCHEMA: ${{ secrets[format('LIQUIBASE_{0}_SCHEMA', steps.env.outputs.env_upper)] }}
+        run: |
+          echo "🚀 Promoting to ${{ inputs.environment }}..."
+          echo "Source artifact: ${{ inputs.source_artifact_name }}"
+
+          # Build command array to safely handle special characters
+          ARGS=(
+            "liquibase"
+            "update"
+            "--changelog-file=changelog.xml"
+            "--url=$LIQUIBASE_URL"
+            "--username=$LIQUIBASE_USERNAME"
+            "--password=$LIQUIBASE_PASSWORD"
+          )
+
+          # Only add schema parameters if LIQUIBASE_SCHEMA is set
+          if [ -n "$LIQUIBASE_SCHEMA" ]; then
+            ARGS+=("--liquibase-schema-name=$LIQUIBASE_SCHEMA")
+            ARGS+=("--default-schema-name=$LIQUIBASE_SCHEMA")
+          fi
+
+          # Execute with array expansion (properly handles special characters)
+          "${ARGS[@]}"
+
+      - name: Create deployment artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-${{ steps.env.outputs.env_name }}-${{ github.run_number }}
+          path: |
+            liquibase/changelog.xml
+            liquibase/changelogs/
+          retention-days: 90
+
+      - name: Promotion result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "::notice::Promotion to ${{ inputs.environment }} SUCCEEDED"
+          else
+            echo "::error::Promotion to ${{ inputs.environment }} FAILED"
+          fi
